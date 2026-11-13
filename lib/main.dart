@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'ble/epd_client.dart';
@@ -5,7 +7,9 @@ import 'screens/home_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(EpdApp(client: EpdClient()));
+  final client = EpdClient();
+  unawaited(client.loadSavedTargetAndConnect());
+  runApp(EpdApp(client: client));
 }
 
 class EpdApp extends StatefulWidget {

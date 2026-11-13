@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../ble/commands.dart';
 import '../ble/constants.dart';
 import '../ble/epd_client.dart';
 import '../ble/status.dart';
+import 'wifi_setup_screen.dart';
+
+enum RemoteTab { letters, pairs }
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.client});
@@ -17,88 +21,168 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final _scaffoldKey = GlobalKey<ScaffoldState>();
-  final _letterController = TextEditingController();
-  final _groupController = TextEditingController();
-  final _pairs = <_PairDraft>[ _PairDraft() ];
+  final _addressController = TextEditingController();
 
-  EpdMode _editorMode = EpdMode.letter;
-  bool _letterDirty = false;
-  bool _groupDirty = false;
-  bool _userPickedMode = false;
+  final Set<String> _selectedLetters = <String>{};
+  final Map<String, String?> _pairDigits = {
+    for (final letter in kPresetLetters) letter: null,
+  };
+
+  RemoteTab _editorTab = RemoteTab.letters;
+  bool _addressDirty = false;
+  bool _lettersDirty = false;
+  bool _pairsDirty = false;
+  bool _userPickedTab = false;
 
   EpdClient get _client => widget.client;
 
   @override
   void initState() {
     super.initState();
+    _syncFromClient();
     _client.addListener(_onClientChanged);
   }
 
   @override
   void dispose() {
     _client.removeListener(_onClientChanged);
-    _letterController.dispose();
-    _groupController.dispose();
-    for (final row in _pairs) {
-      row.dispose();
-    }
+    _addressController.dispose();
     super.dispose();
   }
 
   void _onClientChanged() {
-    final status = _client.status;
-    if (status.letter != null) {
-      if (!_letterDirty || _letterController.text == status.letter) {
-        _letterDirty = false;
-        if (_letterController.text != status.letter) {
-          _letterController.value = TextEditingValue(
-            text: status.letter!,
-            selection: TextSelection.collapsed(offset: status.letter!.length),
-          );
-        }
-      }
-    }
-    if (status.group != null) {
-      if (!_groupDirty || _groupController.text == status.group) {
-        _groupDirty = false;
-        if (_groupController.text != status.group) {
-          _groupController.value = TextEditingValue(
-            text: status.group!,
-            selection: TextSelection.collapsed(offset: status.group!.length),
-          );
-        }
-      }
-    }
-    if (!_userPickedMode && status.mode != null && _editorMode != status.mode) {
-      _editorMode = status.mode!;
-    }
+    _syncFromClient();
     if (mounted) setState(() {});
   }
 
+  void _syncFromClient() {
+    if (!_addressDirty &&
+        _client.savedIp != null &&
+        _client.savedIp!.isNotEmpty &&
+        _addressController.text != _client.savedIp) {
+      _addressController.text = _client.savedIp!;
+    }
+
+    final status = _client.status;
+    if (!_lettersDirty) {
+      if (status.mode == EpdMode.letter && status.letter != null) {
+        final letter = lettersOnly(status.letter!);
+        if (kPresetLetters.contains(letter)) {
+          _selectedLetters
+            ..clear()
+            ..add(letter);
+        }
+      } else if (status.mode == EpdMode.group &&
+          status.group != null &&
+          !status.isStandby) {
+        final synced = <String>{
+          for (final ch in status.group!.toUpperCase().split(''))
+            if (kPresetLetters.contains(ch)) ch,
+        };
+        if (synced.isNotEmpty) {
+          _selectedLetters
+            ..clear()
+            ..addAll(synced);
+        }
+      }
+    }
+
+    if (!_pairsDirty && status.pairs.isNotEmpty) {
+      for (final letter in kPresetLetters) {
+        _pairDigits[letter] = null;
+      }
+      for (final pair in status.pairs) {
+        if (kPresetLetters.contains(pair.letter)) {
+          _pairDigits[pair.letter] = pair.digit;
+        }
+      }
+    }
+
+    if (!_userPickedTab && status.mode != null && !status.isStandby) {
+      final targetTab =
+          status.mode == EpdMode.pairs ? RemoteTab.pairs : RemoteTab.letters;
+      if (_editorTab != targetTab) {
+        _editorTab = targetTab;
+      }
+    }
+  }
+
+  List<String> get _sortedSelectedLetters =>
+      normalizeLettersSelection(_selectedLetters);
+
+  List<LetterDigitPair> get _selectedPairs => presetPairsFromMap(_pairDigits);
+
   bool get _canSend {
     if (!_client.isConnected || _client.updating) return false;
-    return switch (_editorMode) {
-      EpdMode.letter => isValidLetter(_letterController.text),
-      EpdMode.group => isValidGroup(_groupController.text),
-      EpdMode.pairs => isValidPairs(_currentPairs()),
+    return switch (_editorTab) {
+      RemoteTab.letters => isValidLettersSelection(_selectedLetters),
+      RemoteTab.pairs => isValidPairs(_selectedPairs),
     };
   }
 
-  List<LetterDigitPair> _currentPairs() => [
-    for (final row in _pairs)
-      LetterDigitPair(letter: row.letter, digit: row.digit),
-  ];
+  String get _sendButtonLabel {
+    return switch (_editorTab) {
+      RemoteTab.letters => switch (_sortedSelectedLetters.length) {
+          0 => 'Select Letters to Send',
+          1 => 'Send Single (${_sortedSelectedLetters.first})',
+          _ => 'Send Multiple (${_sortedSelectedLetters.join()})',
+        },
+      RemoteTab.pairs => _selectedPairs.isEmpty
+          ? 'Select Pair Numbers to Send'
+          : 'Send Pairs (${_selectedPairs.map((p) => '${p.letter}${p.digit}').join(', ')})',
+    };
+  }
+
+  void _toggleLetter(String letter) {
+    setState(() {
+      _lettersDirty = true;
+      if (_selectedLetters.contains(letter)) {
+        _selectedLetters.remove(letter);
+      } else if (_selectedLetters.length >= kGroupMaxLen) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Up to $kGroupMaxLen letters can be selected at once.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else {
+        _selectedLetters.add(letter);
+      }
+    });
+  }
+
+  void _togglePairDigit(String letter, String digit) {
+    setState(() {
+      _pairsDirty = true;
+      if (_pairDigits[letter] == digit) {
+        _pairDigits[letter] = null;
+      } else {
+        _pairDigits[letter] = digit;
+      }
+    });
+  }
 
   Future<void> _send() async {
     try {
-      switch (_editorMode) {
-        case EpdMode.letter:
-          await _client.sendLetter(_letterController.text);
-        case EpdMode.group:
-          await _client.sendGroup(_groupController.text);
-        case EpdMode.pairs:
-          await _client.sendPairs(_currentPairs());
+      switch (_editorTab) {
+        case RemoteTab.letters:
+          await _client.sendLettersSelection(_selectedLetters);
+          _lettersDirty = false;
+        case RemoteTab.pairs:
+          await _client.sendPairs(_selectedPairs);
+          _pairsDirty = false;
       }
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$error')),
+      );
+    }
+  }
+
+  Future<void> _sendStandby() async {
+    try {
+      await _client.sendStandby();
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -121,33 +205,175 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _applyCommand(String command) {
-    final kind = SentCommand(command: command, sentAt: DateTime.now()).mode;
+    final sent = SentCommand(command: command, sentAt: DateTime.now());
+    if (sent.isStandby) return;
+
+    final kind = sent.mode;
     if (kind == null) return;
     setState(() {
-      _userPickedMode = true;
-      _editorMode = kind;
+      _userPickedTab = true;
       switch (kind) {
         case EpdMode.letter:
-          final letter = command.substring(2);
-          _letterController.text = letter;
-          _letterDirty = true;
         case EpdMode.group:
-          final group = command.substring(2);
-          _groupController.text = group;
-          _groupDirty = true;
-        case EpdMode.pairs:
-          for (final row in _pairs) {
-            row.dispose();
-          }
-          _pairs
+          _editorTab = RemoteTab.letters;
+          final letters = sent.payload.toUpperCase().split('');
+          _selectedLetters
             ..clear()
-            ..addAll([
-              for (final pair in pairsFromCommand(command))
-                _PairDraft(letter: pair.letter, digit: pair.digit),
-            ]);
-          if (_pairs.isEmpty) _pairs.add(_PairDraft());
+            ..addAll(letters.where(kPresetLetters.contains));
+          _lettersDirty = true;
+        case EpdMode.pairs:
+          _editorTab = RemoteTab.pairs;
+          for (final letter in kPresetLetters) {
+            _pairDigits[letter] = null;
+          }
+          for (final pair in pairsFromCommand(command)) {
+            if (kPresetLetters.contains(pair.letter)) {
+              _pairDigits[pair.letter] = pair.digit;
+            }
+          }
+          _pairsDirty = true;
       }
     });
+  }
+
+  Future<void> _openWifiSetup() async {
+    await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (context) => WifiSetupScreen(client: _client),
+      ),
+    );
+    if (!mounted) return;
+    if (_client.savedIp != null && _client.savedIp!.isNotEmpty) {
+      _addressDirty = false;
+      _addressController.text = _client.savedIp!;
+      setState(() {});
+    }
+  }
+
+  Future<void> _connectOverWifi() async {
+    FocusScope.of(context).unfocus();
+    final input = _addressController.text.trim().isEmpty
+        ? _client.preferredTarget
+        : _addressController.text;
+    await _client.connectToAddress(input);
+  }
+
+  Future<void> _copyUrl(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Copied $url')),
+    );
+  }
+
+  Future<void> _openBrowserUrl(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open $url')),
+      );
+    }
+  }
+
+  Future<void> _confirmAndResetBoardWifi() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Reset Board Wi-Fi?'),
+        content: const Text(
+          'This clears the saved Wi-Fi credentials on the EPD-C6 and reboots it into Bluetooth Setup ("BT Setup") mode.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Reset to BT Setup'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _client.resetDeviceWifi();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Board is rebooting into BT Setup mode.'),
+      ),
+    );
+  }
+
+  void _showWifiOptionsSheet() {
+    final url = _client.webConsoleUrl;
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (url != null) ...[
+                ListTile(
+                  leading: const Icon(Icons.copy),
+                  title: const Text('Copy Board Web URL'),
+                  subtitle: Text(url),
+                  onTap: () {
+                    Navigator.of(sheetContext).pop();
+                    _copyUrl(url);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.open_in_new),
+                  title: const Text('Open Board Web Console'),
+                  subtitle: Text('${_client.mDnsConsoleUrl} or $url'),
+                  onTap: () {
+                    Navigator.of(sheetContext).pop();
+                    _openBrowserUrl(url);
+                  },
+                ),
+              ],
+              ListTile(
+                leading: const Icon(Icons.bluetooth_searching),
+                title: const Text('Set Up Wi-Fi via Bluetooth'),
+                subtitle: const Text('Provision a new 2.4 GHz network'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _openWifiSetup();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.link_off),
+                title: const Text('Disconnect Remote'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _client.disconnect();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.restart_alt,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                title: Text(
+                  'Reset Board Wi-Fi (BT Setup)',
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+                subtitle: const Text('Clears Wi-Fi on board and re-enables BLE'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _confirmAndResetBoardWifi();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   Widget _historyDrawer(EpdClient client) {
@@ -159,7 +385,10 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-              child: Text('History', style: Theme.of(context).textTheme.titleLarge),
+              child: Text(
+                'History',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -206,6 +435,12 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('EPD-C6'),
         actions: [
+          if (client.isConnected)
+            IconButton(
+              tooltip: 'Refresh status',
+              onPressed: client.updating ? null : client.refreshStatus,
+              icon: const Icon(Icons.refresh),
+            ),
           Builder(
             builder: (context) {
               return IconButton(
@@ -226,244 +461,362 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
       endDrawer: _historyDrawer(client),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: client.isConnected ? _connectedBody(client) : _disconnectedBody(client),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: client.isConnected
+                ? _connectedBody(client)
+                : _disconnectedBody(client),
+          ),
+        ),
       ),
     );
   }
 
   Widget _disconnectedBody(EpdClient client) {
-    final busy = client.connection == EpdConnectionState.scanning ||
-        client.connection == EpdConnectionState.connecting;
-    final disconnected = client.errorMessage?.contains('Disconnected') ?? false;
-    final label = switch (client.connection) {
-      EpdConnectionState.scanning => 'Scanning…',
-      EpdConnectionState.connecting => 'Connecting…',
-      _ => disconnected ? 'Reconnect' : 'Scan & connect',
-    };
+    final connecting = client.connection == EpdConnectionState.connecting;
+    final previewUrl = client.webConsoleUrl;
 
     return ListView(
       children: [
-        const Text('Connect to the e-paper board over Bluetooth.'),
-        const SizedBox(height: 16),
-        FilledButton.icon(
-          onPressed: busy ? null : client.scanAndConnect,
-          icon: busy
-              ? const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.bluetooth_searching),
-          label: Text(label),
-        ),
-        if (client.errorMessage != null) ...[
-          const SizedBox(height: 12),
-          Text(
-            client.errorMessage!,
-            style: TextStyle(color: Theme.of(context).colorScheme.error),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.wifi,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Connect over Wi-Fi',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          if (client.savedSsid != null)
+                            Text(
+                              'Last network: ${client.savedSsid}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _addressController,
+                  enabled: !connecting,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'Board IP or Hostname',
+                    hintText: '192.168.1.42 or epd-c6.local',
+                    helperText:
+                        'Shown in the top-left corner of the e-paper display.',
+                    prefixIcon: Icon(Icons.lan_outlined),
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (_) {
+                    _addressDirty = true;
+                    setState(() {});
+                  },
+                  onSubmitted: (_) {
+                    if (!connecting) _connectOverWifi();
+                  },
+                ),
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: connecting ? null : _connectOverWifi,
+                  icon: connecting
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.settings_remote),
+                  label: Text(connecting ? 'Connecting…' : 'Connect Remote'),
+                ),
+                if (previewUrl != null) ...[
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      TextButton.icon(
+                        onPressed: () => _openBrowserUrl(previewUrl),
+                        icon: const Icon(Icons.open_in_new, size: 18),
+                        label: Text('Open $previewUrl'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _copyUrl(previewUrl),
+                        icon: const Icon(Icons.copy, size: 18),
+                        label: const Text('Copy URL'),
+                      ),
+                    ],
+                  ),
+                ],
+                if (client.errorMessage != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    client.errorMessage!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
-        ],
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.bluetooth,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Configure Board Wi-Fi',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Is the e-paper showing "BT Setup"? Use Bluetooth to connect the EPD-C6 to a 2.4 GHz Wi-Fi network.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 16),
+                FilledButton.tonalIcon(
+                  onPressed: _openWifiSetup,
+                  icon: const Icon(Icons.bluetooth_searching),
+                  label: const Text('Set Up Wi-Fi via Bluetooth'),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
 
   Widget _connectedBody(EpdClient client) {
+    final isStandby = client.status.isStandby;
+    final onDevice = client.status.onDeviceSummary;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _StatusHeader(client: client),
-        const SizedBox(height: 16),
-        SegmentedButton<EpdMode>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(value: EpdMode.letter, label: Text('Single')),
-            ButtonSegment(value: EpdMode.group, label: Text('Multiple')),
-            ButtonSegment(value: EpdMode.pairs, label: Text('List')),
-          ],
-          selected: {_editorMode},
-          onSelectionChanged: (selection) {
-            setState(() {
-              _userPickedMode = true;
-              _editorMode = selection.first;
-            });
-          },
+        _StatusHeader(
+          client: client,
+          onCopyUrl: client.webConsoleUrl == null
+              ? null
+              : () => _copyUrl(client.webConsoleUrl!),
+          onOpenOptions: _showWifiOptionsSheet,
         ),
-        if (client.status.mode != null) ...[
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: SegmentedButton<RemoteTab>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(
+                    value: RemoteTab.letters,
+                    icon: Icon(Icons.sort_by_alpha, size: 18),
+                    label: Text('Letters'),
+                  ),
+                  ButtonSegment(
+                    value: RemoteTab.pairs,
+                    icon: Icon(Icons.format_list_numbered, size: 18),
+                    label: Text('Pairs'),
+                  ),
+                ],
+                selected: {_editorTab},
+                onSelectionChanged: (selection) {
+                  setState(() {
+                    _userPickedTab = true;
+                    _editorTab = selection.first;
+                  });
+                },
+              ),
+            ),
+            const SizedBox(width: 10),
+            isStandby
+                ? FilledButton.icon(
+                    onPressed: client.updating ? null : _sendStandby,
+                    icon: const Icon(Icons.pause_circle_filled, size: 18),
+                    label: const Text(kStandbyWord),
+                  )
+                : FilledButton.tonalIcon(
+                    onPressed: client.updating ? null : _sendStandby,
+                    icon: const Icon(Icons.pause_circle_outline, size: 18),
+                    label: const Text(kStandbyWord),
+                  ),
+          ],
+        ),
+        if (onDevice.isNotEmpty) ...[
           const SizedBox(height: 8),
           Text(
-            'On device: ${client.status.mode!.label}',
+            'On device: $onDevice',
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ],
         if (client.updating) ...[
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           const LinearProgressIndicator(),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Text(
             'Updating… e-paper refresh is slow.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ],
-        const SizedBox(height: 16),
-        Expanded(child: _editor()),
+        if (client.errorMessage != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            client.errorMessage!,
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        ],
+        const SizedBox(height: 12),
+        Expanded(
+          child: switch (_editorTab) {
+            RemoteTab.letters => _lettersEditor(),
+            RemoteTab.pairs => _pairsEditor(),
+          },
+        ),
+        const SizedBox(height: 12),
         FilledButton(
           onPressed: _canSend ? _send : null,
-          child: const Text('Send'),
+          child: Text(_sendButtonLabel),
         ),
       ],
     );
   }
 
-  Widget _editor() {
-    return switch (_editorMode) {
-      EpdMode.letter => _letterEditor(),
-      EpdMode.group => _groupEditor(),
-      EpdMode.pairs => _pairsEditor(),
+  Widget _lettersEditor() {
+    final sorted = _sortedSelectedLetters;
+    final subtitle = switch (sorted.length) {
+      0 => 'Tap 1 letter for Single, or up to $kGroupMaxLen letters for Multiple.',
+      1 => 'Single letter: ${sorted.first}',
+      _ => 'Multiple (${sorted.length}/$kGroupMaxLen): ${sorted.join(' ')}',
     };
-  }
 
-  Widget _letterEditor() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        TextField(
-          controller: _letterController,
-          textCapitalization: TextCapitalization.characters,
-          maxLength: 1,
-          inputFormatters: [
-            FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z]')),
-            _UpperCaseFormatter(),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                subtitle,
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ),
+            TextButton(
+              onPressed: _selectedLetters.isEmpty
+                  ? null
+                  : () => setState(() {
+                        _lettersDirty = true;
+                        _selectedLetters.clear();
+                      }),
+              child: const Text('Clear'),
+            ),
           ],
-          decoration: const InputDecoration(
-            labelText: 'Letter',
-            hintText: 'A–Z',
-            border: OutlineInputBorder(),
-            counterText: '',
-          ),
-          onChanged: (_) {
-            _letterDirty = true;
-            setState(() {});
-          },
         ),
         const SizedBox(height: 8),
-        Text(
-          'Shows one large letter on the panel.',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-      ],
-    );
-  }
+        Expanded(
+          child: SingleChildScrollView(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                const spacing = 12.0;
+                final columns = constraints.maxWidth >= 460 ? 4 : 3;
+                final tileWidth =
+                    (constraints.maxWidth - spacing * (columns - 1)) / columns;
 
-  Widget _groupEditor() {
-    final letters = lettersOnly(_groupController.text);
-    final hint = letters.length < kGroupMinLen
-        ? 'Enter $kGroupMinLen–$kGroupMaxLen letters'
-        : letters.length > kGroupMaxLen
-            ? 'At most $kGroupMaxLen letters'
-            : null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        TextField(
-          controller: _groupController,
-          textCapitalization: TextCapitalization.characters,
-          maxLength: kGroupMaxLen,
-          inputFormatters: [
-            FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z]')),
-            _UpperCaseFormatter(),
-          ],
-          decoration: InputDecoration(
-            labelText: 'Letters',
-            hintText: 'ABCDE',
-            border: const OutlineInputBorder(),
-            errorText: _groupController.text.isEmpty ? null : hint,
+                return Wrap(
+                  spacing: spacing,
+                  runSpacing: spacing,
+                  children: [
+                    for (final letter in kPresetLetters)
+                      _LetterToggleButton(
+                        letter: letter,
+                        selected: _selectedLetters.contains(letter),
+                        width: tileWidth,
+                        onTap: () => _toggleLetter(letter),
+                      ),
+                  ],
+                );
+              },
+            ),
           ),
-          onChanged: (_) {
-            _groupDirty = true;
-            setState(() {});
-          },
         ),
       ],
     );
   }
 
   Widget _pairsEditor() {
+    final activePairs = _selectedPairs;
+    final summary = activePairs.isEmpty
+        ? 'Tap a number next to each letter (A–G) to set its order.'
+        : 'Selected: ${activePairs.map((p) => '${p.letter}${p.digit}').join(', ')}';
+
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                summary,
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ),
+            TextButton(
+              onPressed: activePairs.isEmpty
+                  ? null
+                  : () => setState(() {
+                        _pairsDirty = true;
+                        for (final letter in kPresetLetters) {
+                          _pairDigits[letter] = null;
+                        }
+                      }),
+              child: const Text('Clear all'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
         Expanded(
           child: ListView.separated(
-            itemCount: _pairs.length,
+            itemCount: kPresetLetters.length,
             separatorBuilder: (context, index) => const SizedBox(height: 8),
             itemBuilder: (context, index) {
-              final row = _pairs[index];
-              return Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: row.letterController,
-                      textCapitalization: TextCapitalization.characters,
-                      maxLength: 1,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z]')),
-                        _UpperCaseFormatter(),
-                      ],
-                      decoration: const InputDecoration(
-                        labelText: 'Letter',
-                        border: OutlineInputBorder(),
-                        counterText: '',
-                      ),
-                      onChanged: (value) {
-                        row.letter = lettersOnly(value);
-                        setState(() {});
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: TextField(
-                      controller: row.digitController,
-                      keyboardType: TextInputType.number,
-                      maxLength: 1,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[0-9]')),
-                      ],
-                      decoration: const InputDecoration(
-                        labelText: 'Digit',
-                        border: OutlineInputBorder(),
-                        counterText: '',
-                      ),
-                      onChanged: (value) {
-                        row.digit = value;
-                        setState(() {});
-                      },
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: _pairs.length <= 1
-                        ? null
-                        : () {
-                            setState(() {
-                              row.dispose();
-                              _pairs.removeAt(index);
-                            });
-                          },
-                    icon: const Icon(Icons.remove_circle_outline),
-                  ),
-                ],
+              final letter = kPresetLetters[index];
+              final selectedDigit = _pairDigits[letter];
+              return _PresetPairRow(
+                letter: letter,
+                selectedDigit: selectedDigit,
+                onDigitTap: (digit) => _togglePairDigit(letter, digit),
               );
             },
-          ),
-        ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton.icon(
-            onPressed: _pairs.length >= kPairsMax
-                ? null
-                : () => setState(() => _pairs.add(_PairDraft())),
-            icon: const Icon(Icons.add),
-            label: Text('Add pair (${_pairs.length}/$kPairsMax)'),
           ),
         ),
       ],
@@ -471,39 +824,203 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class _PairDraft {
-  _PairDraft({String letter = '', String digit = ''})
-      : letter = letter,
-        digit = digit,
-        letterController = TextEditingController(text: letter),
-        digitController = TextEditingController(text: digit);
+class _LetterToggleButton extends StatelessWidget {
+  const _LetterToggleButton({
+    required this.letter,
+    required this.selected,
+    required this.width,
+    required this.onTap,
+  });
 
-  String letter;
-  String digit;
-  final TextEditingController letterController;
-  final TextEditingController digitController;
+  final String letter;
+  final bool selected;
+  final double width;
+  final VoidCallback onTap;
 
-  void dispose() {
-    letterController.dispose();
-    digitController.dispose();
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      width: width,
+      height: 76,
+      child: Material(
+        color: selected ? scheme.primary : scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(16),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: onTap,
+          child: Center(
+            child: Text(
+              letter,
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                    color: selected ? scheme.onPrimary : scheme.onSurface,
+                  ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PresetPairRow extends StatelessWidget {
+  const _PresetPairRow({
+    required this.letter,
+    required this.selectedDigit,
+    required this.onDigitTap,
+  });
+
+  final String letter;
+  final String? selectedDigit;
+  final ValueChanged<String> onDigitTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final hasDigit = selectedDigit != null;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: hasDigit
+            ? scheme.primaryContainer.withValues(alpha: 0.45)
+            : scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: hasDigit ? scheme.primary : scheme.outlineVariant,
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: hasDigit ? scheme.primary : scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              hasDigit ? '$letter$selectedDigit' : letter,
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                    color: hasDigit ? scheme.onPrimary : scheme.onSurface,
+                  ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Row(
+              children: [
+                for (final digit in kPairOrderDigits)
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 2),
+                      child: _DigitOrderButton(
+                        digit: digit,
+                        selected: selectedDigit == digit,
+                        onTap: () => onDigitTap(digit),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DigitOrderButton extends StatelessWidget {
+  const _DigitOrderButton({
+    required this.digit,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String digit;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 38,
+      child: Material(
+        color: selected ? scheme.primary : scheme.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: BorderSide(
+            color: selected ? scheme.primary : scheme.outlineVariant,
+          ),
+        ),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onTap,
+          child: Center(
+            child: Text(
+              digit,
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    fontWeight:
+                        selected ? FontWeight.bold : FontWeight.normal,
+                    color: selected ? scheme.onPrimary : scheme.onSurface,
+                  ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
 class _StatusHeader extends StatelessWidget {
-  const _StatusHeader({required this.client});
+  const _StatusHeader({
+    required this.client,
+    required this.onCopyUrl,
+    required this.onOpenOptions,
+  });
 
   final EpdClient client;
+  final VoidCallback? onCopyUrl;
+  final VoidCallback onOpenOptions;
 
   @override
   Widget build(BuildContext context) {
+    final ssid = client.status.ssid ?? client.savedSsid;
+    final address = client.status.ip ?? client.activeTarget ?? '';
+    final label = ssid != null && ssid.isNotEmpty
+        ? '$ssid ($address)'
+        : 'Wi-Fi ($address)';
+
     return Row(
       children: [
-        const Icon(Icons.bluetooth_connected, size: 20),
+        Icon(
+          Icons.wifi,
+          size: 20,
+          color: Theme.of(context).colorScheme.primary,
+        ),
         const SizedBox(width: 8),
-        const Expanded(child: Text('Connected')),
-        TextButton(
-          onPressed: client.disconnect,
-          child: const Text('Disconnect'),
+        Expanded(
+          child: Text(
+            label,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+        ),
+        if (onCopyUrl != null)
+          IconButton(
+            tooltip: 'Copy board web URL',
+            onPressed: onCopyUrl,
+            icon: const Icon(Icons.copy, size: 18),
+            visualDensity: VisualDensity.compact,
+          ),
+        TextButton.icon(
+          onPressed: onOpenOptions,
+          icon: const Icon(Icons.tune, size: 18),
+          label: const Text('Wi-Fi'),
         ),
       ],
     );
@@ -530,15 +1047,5 @@ class _BatteryChip extends StatelessWidget {
       label: Text(label),
       visualDensity: VisualDensity.compact,
     );
-  }
-}
-
-class _UpperCaseFormatter extends TextInputFormatter {
-  @override
-  TextEditingValue formatEditUpdate(
-    TextEditingValue oldValue,
-    TextEditingValue newValue,
-  ) {
-    return newValue.copyWith(text: newValue.text.toUpperCase());
   }
 }

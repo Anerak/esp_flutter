@@ -16,17 +16,80 @@ class LetterDigitPair {
 
   @override
   int get hashCode => Object.hash(letter, digit);
+
+  @override
+  String toString() => '$letter$digit';
 }
 
 String lettersOnly(String input) =>
     input.toUpperCase().replaceAll(RegExp(r'[^A-Z]'), '');
 
-bool isValidLetter(String input) => _letterPattern.hasMatch(lettersOnly(input)) &&
+bool isValidLetter(String input) =>
+    _letterPattern.hasMatch(lettersOnly(input)) &&
     lettersOnly(input).length == 1;
 
 bool isValidGroup(String input) {
   final letters = lettersOnly(input);
   return letters.length >= kGroupMinLen && letters.length <= kGroupMaxLen;
+}
+
+/// Normalizes selected letters to unique uppercase A–Z letters sorted in
+/// alphabetical (A–G) order.
+List<String> normalizeLettersSelection(Iterable<String> selected) {
+  final unique = <String>{};
+  for (final raw in selected) {
+    final cleaned = lettersOnly(raw);
+    for (var i = 0; i < cleaned.length; i++) {
+      final ch = cleaned[i];
+      if (_letterPattern.hasMatch(ch)) {
+        unique.add(ch);
+      }
+    }
+  }
+  final sorted = unique.toList()..sort();
+  return sorted;
+}
+
+bool isValidLettersSelection(Iterable<String> selected) {
+  final normalized = normalizeLettersSelection(selected);
+  return normalized.isNotEmpty && normalized.length <= kGroupMaxLen;
+}
+
+/// Builds `L:<X>` when 1 letter is toggled or `G:<XYZ>` (in A–G order) when
+/// 2..5 letters are toggled.
+String lettersSelectionCommand(Iterable<String> selected) {
+  final normalized = normalizeLettersSelection(selected);
+  if (normalized.isEmpty) {
+    throw ArgumentError('Select at least 1 letter');
+  }
+  if (normalized.length > kGroupMaxLen) {
+    throw ArgumentError('Select at most $kGroupMaxLen letters');
+  }
+  if (normalized.length == 1) {
+    return letterCommand(normalized.first);
+  }
+  return groupCommand(normalized.join());
+}
+
+/// Builds the 1-tap stand-by display command (`G:THINK`).
+String standbyCommand() => 'G:$kStandbyWord';
+
+/// Converts a map of letter -> order digit (`'1'`..`'7'` or null) into
+/// `LetterDigitPair` items ordered by [letters] (`A` through `G`).
+List<LetterDigitPair> presetPairsFromMap(
+  Map<String, String?> assignments, {
+  List<String> letters = kPresetLetters,
+}) {
+  final pairs = <LetterDigitPair>[];
+  for (final rawLetter in letters) {
+    final letter = lettersOnly(rawLetter);
+    if (!_letterPattern.hasMatch(letter)) continue;
+    final digit = assignments[letter]?.trim() ?? '';
+    if (_digitPattern.hasMatch(digit)) {
+      pairs.add(LetterDigitPair(letter: letter, digit: digit));
+    }
+  }
+  return pairs;
 }
 
 bool isCompletePair(LetterDigitPair pair) =>
@@ -55,6 +118,8 @@ class SentCommand {
   final String command;
   final DateTime sentAt;
 
+  bool get isStandby => command.toUpperCase() == standbyCommand();
+
   EpdMode? get mode {
     if (command.startsWith('L:')) return EpdMode.letter;
     if (command.startsWith('G:')) return EpdMode.group;
@@ -73,6 +138,7 @@ class SentCommand {
   }
 
   String get summary {
+    if (isStandby) return 'Stand-by $kStandbyWord';
     final kind = mode;
     if (kind == null) return command;
     return '${kind.label} $displayPayload';
@@ -83,8 +149,12 @@ class SentCommand {
 
 List<LetterDigitPair> pairsFromCommand(String command) {
   if (!command.startsWith('P:')) return const [];
+  return completePairs(pairsFromTokens(command.substring(2).split(',')));
+}
+
+List<LetterDigitPair> pairsFromTokens(Iterable<String> tokens) {
   return completePairs(
-    command.substring(2).split(',').map((token) {
+    tokens.map((token) {
       final trimmed = token.trim();
       if (trimmed.length < 2) {
         return const LetterDigitPair(letter: '', digit: '');
